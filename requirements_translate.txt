@@ -1,0 +1,4 @@
+# Dependencies for translate_summaries.py
+openai>=1.0.0
+tqdm>=4.65.0
+json-repair>=0.28.0
