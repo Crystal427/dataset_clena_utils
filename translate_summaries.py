@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Translate regular_summary and brief_summary from English to Chinese using vLLM with OpenAI API.
+Translate regular_summary and brief_summary to Chinese and Japanese using vLLM with OpenAI API.
 
 This script:
 1. Reads all JSONL files from an input folder
-2. For records with is_truncated=false, translates regular_summary and brief_summary to Chinese
-3. Outputs new JSONL files with added regular_summary_cn and brief_summary_cn fields
+2. For records with is_truncated=false, translates regular_summary and brief_summary to both Chinese and Japanese
+3. Outputs new JSONL files with added fields:
+   - regular_summary_cn, brief_summary_cn (Chinese)
+   - regular_summary_ja, brief_summary_ja (Japanese)
 """
 
 import os
@@ -23,7 +25,7 @@ from json_repair import repair_json
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Translate summaries in JSONL files to Chinese using vLLM"
+        description="Translate summaries in JSONL files to Chinese and Japanese using vLLM"
     )
     parser.add_argument(
         "--input_dir",
@@ -64,8 +66,8 @@ def parse_args():
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=4096,
-        help="Maximum tokens for generation (default: 4096)"
+        default=8192,
+        help="Maximum tokens for generation (default: 8192)"
     )
     parser.add_argument(
         "--concurrency",
@@ -76,62 +78,60 @@ def parse_args():
     parser.add_argument(
         "--timeout",
         type=float,
-        default=120.0,
-        help="Timeout for API requests in seconds (default: 120)"
+        default=180.0,
+        help="Timeout for API requests in seconds (default: 180)"
     )
     return parser.parse_args()
 
 
 def build_translation_prompt(regular_summary: Optional[str], brief_summary: Optional[str]) -> str:
     """
-    Build a detailed prompt for translating summaries to Chinese.
-    
-    Args:
-        regular_summary: The detailed summary text (may be None or empty)
-        brief_summary: The brief summary text (may be None or empty)
-    
-    Returns:
-        A formatted prompt string for the translation task
+    Build a detailed prompt for translating summaries to both Chinese and Japanese.
     """
-    prompt = """你是一位专业的英中翻译专家，擅长将英文图像描述准确、流畅地翻译成中文。
+    prompt = """You are a professional translator specializing in English to Chinese and Japanese translation. Your task is to accurately translate image descriptions.
 
-## 翻译要求：
-1. **准确性**：忠实原文含义，不遗漏任何细节，不添加原文没有的内容
-2. **专业术语**：
-   - 动漫/游戏角色名保留原文或使用官方中文译名
-   - 艺术术语使用专业中文表达（如：构图、光影、色调等）
-   - 服装/配饰名称使用准确的中文描述
-3. **流畅性**：译文符合中文表达习惯，语句通顺自然
-4. **格式保持**：保持原文的段落结构和编号格式
+## Translation Requirements:
 
-## 需要翻译的内容：
+### For Chinese (中文):
+1. **Accuracy**: Faithfully convey the original meaning without omitting details or adding content
+2. **Terminology**: Use official Chinese names for anime/game characters; use professional art terms (构图, 光影, 色调, etc.)
+3. **Fluency**: Ensure natural Chinese expression
+
+### For Japanese (日本語):
+1. **Accuracy**: 原文の意味に忠実に、詳細を漏らさない
+2. **Terminology**: アニメ/ゲームキャラクターは公式日本語名を使用；専門的な芸術用語を使用
+3. **Fluency**: 自然な日本語表現を心がける
+
+## Content to Translate:
 
 """
     
     has_content = False
     
     if regular_summary and str(regular_summary).strip() and str(regular_summary).lower() != 'nan':
-        prompt += f"### Regular Summary (详细描述):\n{regular_summary}\n\n"
+        prompt += f"### Regular Summary (Detailed Description):\n{regular_summary}\n\n"
         has_content = True
     
     if brief_summary and str(brief_summary).strip() and str(brief_summary).lower() != 'nan':
-        prompt += f"### Brief Summary (简要描述):\n{brief_summary}\n\n"
+        prompt += f"### Brief Summary:\n{brief_summary}\n\n"
         has_content = True
     
     if not has_content:
         return None
     
-    prompt += """## 输出格式要求：
-请严格按照以下JSON格式输出翻译结果，不要输出任何其他内容：
+    prompt += """## Output Format:
+Please output the translation results in the following JSON format. Do not output anything else:
 
 ```json
 {
-    "regular_summary_cn": "详细描述的中文翻译（如果原文没有则为null）",
-    "brief_summary_cn": "简要描述的中文翻译（如果原文没有则为null）"
+    "regular_summary_cn": "Chinese translation of detailed description (null if no original)",
+    "brief_summary_cn": "Chinese translation of brief summary (null if no original)",
+    "regular_summary_ja": "Japanese translation of detailed description (null if no original)",
+    "brief_summary_ja": "Japanese translation of brief summary (null if no original)"
 }
 ```
 
-请开始翻译："""
+Please translate now:"""
     
     return prompt
 
@@ -144,9 +144,16 @@ def parse_translation_response(response_text: str) -> dict:
         response_text: The raw response text from the model
     
     Returns:
-        A dictionary with regular_summary_cn and brief_summary_cn
+        A dictionary with all translation fields
     """
     import re
+    
+    default_result = {
+        "regular_summary_cn": None,
+        "brief_summary_cn": None,
+        "regular_summary_ja": None,
+        "brief_summary_ja": None
+    }
     
     # Try to extract JSON from markdown code fence first
     json_pattern = r'```(?:json)?\s*\n?([\s\S]*?)\n?```'
@@ -161,10 +168,11 @@ def parse_translation_response(response_text: str) -> dict:
             repaired = repair_json(candidate.strip(), return_objects=True)
             
             if isinstance(repaired, dict):
-                return {
-                    "regular_summary_cn": repaired.get("regular_summary_cn"),
-                    "brief_summary_cn": repaired.get("brief_summary_cn")
-                }
+                result = default_result.copy()
+                for key in default_result.keys():
+                    if key in repaired:
+                        result[key] = repaired[key]
+                return result
         except Exception:
             continue
     
@@ -176,18 +184,16 @@ def parse_translation_response(response_text: str) -> dict:
         try:
             repaired = repair_json(match, return_objects=True)
             if isinstance(repaired, dict):
-                return {
-                    "regular_summary_cn": repaired.get("regular_summary_cn"),
-                    "brief_summary_cn": repaired.get("brief_summary_cn")
-                }
+                result = default_result.copy()
+                for key in default_result.keys():
+                    if key in repaired:
+                        result[key] = repaired[key]
+                return result
         except Exception:
             continue
     
-    # If all parsing fails, return None values
-    return {
-        "regular_summary_cn": None,
-        "brief_summary_cn": None
-    }
+    # If all parsing fails, return default None values
+    return default_result
 
 
 async def translate_single_record(
@@ -199,7 +205,7 @@ async def translate_single_record(
     semaphore: asyncio.Semaphore
 ) -> dict:
     """
-    Translate a single record's summaries to Chinese.
+    Translate a single record's summaries to both Chinese and Japanese.
     
     Args:
         client: AsyncOpenAI client instance
@@ -210,7 +216,7 @@ async def translate_single_record(
         semaphore: Semaphore for controlling concurrency
     
     Returns:
-        The record with added Chinese translation fields
+        The record with added translation fields
     """
     # Create a copy of the record
     result = record.copy()
@@ -222,6 +228,8 @@ async def translate_single_record(
         # Skip truncated records, just add None fields
         result["regular_summary_cn"] = None
         result["brief_summary_cn"] = None
+        result["regular_summary_ja"] = None
+        result["brief_summary_ja"] = None
         return result
     
     regular_summary = record.get("regular_summary")
@@ -234,6 +242,8 @@ async def translate_single_record(
         # No content to translate
         result["regular_summary_cn"] = None
         result["brief_summary_cn"] = None
+        result["regular_summary_ja"] = None
+        result["brief_summary_ja"] = None
         return result
     
     async with semaphore:
@@ -243,7 +253,7 @@ async def translate_single_record(
                 messages=[
                     {
                         "role": "system",
-                        "content": "你是一位专业的英中翻译专家，请准确翻译用户提供的图像描述内容。"
+                        "content": "You are a professional translator. Translate the given image descriptions accurately to both Chinese and Japanese. Output only valid JSON."
                     },
                     {
                         "role": "user",
@@ -259,11 +269,15 @@ async def translate_single_record(
             
             result["regular_summary_cn"] = translation["regular_summary_cn"]
             result["brief_summary_cn"] = translation["brief_summary_cn"]
+            result["regular_summary_ja"] = translation["regular_summary_ja"]
+            result["brief_summary_ja"] = translation["brief_summary_ja"]
             
         except Exception as e:
             print(f"\nError translating record: {e}")
             result["regular_summary_cn"] = None
             result["brief_summary_cn"] = None
+            result["regular_summary_ja"] = None
+            result["brief_summary_ja"] = None
     
     return result
 
@@ -279,89 +293,6 @@ async def process_single_file(
 ) -> tuple[int, int, int]:
     """
     Process a single JSONL file.
-    
-    Args:
-        client: AsyncOpenAI client instance
-        input_path: Path to input JSONL file
-        output_path: Path to output JSONL file
-        model_name: Model name to use
-        temperature: Generation temperature
-        max_tokens: Maximum tokens for generation
-        concurrency: Number of concurrent requests
-    
-    Returns:
-        Tuple of (total_records, translated_records, skipped_records)
-    """
-    # Read all records from input file
-    records = []
-    with open(input_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError as e:
-                    print(f"\nWarning: Failed to parse line in {input_path}: {e}")
-                    continue
-    
-    if not records:
-        print(f"\nWarning: No valid records found in {input_path}")
-        return 0, 0, 0
-    
-    # Create semaphore for controlling concurrency
-    semaphore = asyncio.Semaphore(concurrency)
-    
-    # Count records to translate
-    to_translate = sum(1 for r in records if not r.get("is_truncated", True))
-    
-    # Process all records
-    tasks = [
-        translate_single_record(
-            client, record, model_name, temperature, max_tokens, semaphore
-        )
-        for record in records
-    ]
-    
-    # Use tqdm to show progress
-    results = []
-    with tqdm(total=len(tasks), desc=f"Processing {input_path.name}", leave=False) as pbar:
-        for coro in asyncio.as_completed(tasks):
-            result = await coro
-            results.append(result)
-            pbar.update(1)
-    
-    # Note: as_completed doesn't preserve order, so we need to reprocess
-    # Actually, let's use gather to preserve order
-    results = await asyncio.gather(*[
-        translate_single_record(
-            client, record, model_name, temperature, max_tokens, semaphore
-        )
-        for record in records
-    ])
-    
-    # Write results to output file
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for result in results:
-            f.write(json.dumps(result, ensure_ascii=False) + '\n')
-    
-    translated = sum(1 for r in results if r.get("regular_summary_cn") or r.get("brief_summary_cn"))
-    skipped = len(records) - to_translate
-    
-    return len(records), translated, skipped
-
-
-async def process_single_file_with_progress(
-    client: AsyncOpenAI,
-    input_path: Path,
-    output_path: Path,
-    model_name: str,
-    temperature: float,
-    max_tokens: int,
-    concurrency: int
-) -> tuple[int, int, int]:
-    """
-    Process a single JSONL file with better progress tracking.
     """
     # Read all records from input file
     records = []
@@ -386,11 +317,10 @@ async def process_single_file_with_progress(
     to_translate = sum(1 for r in records if not r.get("is_truncated", True))
     
     print(f"\n📄 Processing: {input_path.name}")
-    print(f"   Total records: {len(records)}, To translate: {to_translate}")
+    print(f"   Total records: {len(records)} | To translate: {to_translate}")
     
     # Process all records with progress bar
-    results = []
-    with tqdm(total=len(records), desc="   Translating", unit="records") as pbar:
+    with tqdm(total=len(records), desc="   Translating (CN+JA)", unit="records") as pbar:
         async def process_with_update(record):
             result = await translate_single_record(
                 client, record, model_name, temperature, max_tokens, semaphore
@@ -407,7 +337,11 @@ async def process_single_file_with_progress(
         for result in results:
             f.write(json.dumps(result, ensure_ascii=False) + '\n')
     
-    translated = sum(1 for r in results if r.get("regular_summary_cn") or r.get("brief_summary_cn"))
+    translated = sum(
+        1 for r in results 
+        if r.get("regular_summary_cn") or r.get("brief_summary_cn") 
+        or r.get("regular_summary_ja") or r.get("brief_summary_ja")
+    )
     skipped = len(records) - to_translate
     
     print(f"   ✅ Completed: {translated} translated, {skipped} skipped (truncated)")
@@ -436,7 +370,7 @@ async def main():
         return
     
     print("=" * 60)
-    print("🚀 Summary Translation Tool")
+    print("🚀 Summary Translation Tool (Chinese + Japanese)")
     print("=" * 60)
     print(f"📁 Input directory:  {input_dir}")
     print(f"📁 Output directory: {output_dir}")
@@ -464,7 +398,7 @@ async def main():
         output_path = output_dir / jsonl_file.name
         
         try:
-            records, translated, skipped = await process_single_file_with_progress(
+            records, translated, skipped = await process_single_file(
                 client=client,
                 input_path=jsonl_file,
                 output_path=output_path,
@@ -489,7 +423,12 @@ async def main():
     print(f"Total records processed: {total_records}")
     print(f"Successfully translated: {total_translated}")
     print(f"Skipped (truncated):     {total_skipped}")
-    print(f"Output directory:        {output_dir}")
+    print(f"\nOutput fields added:")
+    print(f"  - regular_summary_cn (Chinese)")
+    print(f"  - brief_summary_cn (Chinese)")
+    print(f"  - regular_summary_ja (Japanese)")
+    print(f"  - brief_summary_ja (Japanese)")
+    print(f"\nOutput directory: {output_dir}")
     print("=" * 60)
 
 
