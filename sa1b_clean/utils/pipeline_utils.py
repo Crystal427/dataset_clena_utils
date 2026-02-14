@@ -793,21 +793,33 @@ def process_batch(
     return rows
 
 
-def iter_tar_images(tar_path: Path) -> Iterable[Tuple[str, bytes]]:
+def _iter_tar_members(tar: tarfile.TarFile) -> Iterable[Tuple[str, bytes]]:
+    for member in tar:
+        if not member.isfile():
+            continue
+        suffix = Path(member.name).suffix.lower()
+        if suffix not in IMAGE_EXTENSIONS:
+            continue
+        file_obj = tar.extractfile(member)
+        if file_obj is None:
+            continue
+        payload = file_obj.read()
+        if not payload:
+            continue
+        yield member.name, payload
+
+
+def iter_tar_images(
+    tar_path: Path, prefetch_to_memory: bool = False
+) -> Iterable[Tuple[str, bytes]]:
+    if prefetch_to_memory:
+        tar_bytes = tar_path.read_bytes()
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:*") as tar:
+            yield from _iter_tar_members(tar)
+        return
+
     with tarfile.open(tar_path, "r:*") as tar:
-        for member in tar:
-            if not member.isfile():
-                continue
-            suffix = Path(member.name).suffix.lower()
-            if suffix not in IMAGE_EXTENSIONS:
-                continue
-            file_obj = tar.extractfile(member)
-            if file_obj is None:
-                continue
-            payload = file_obj.read()
-            if not payload:
-                continue
-            yield member.name, payload
+        yield from _iter_tar_members(tar)
 
 
 def worker_entry(
@@ -829,6 +841,7 @@ def worker_entry(
     cleanvision_scorer = CleanVisionBatchScorer(thresholds)
     cv_workers = max(1, min(args_dict["cv_workers"], args_dict["cpu_threads_per_worker"]))
     cv_chunk_size = max(1, args_dict["cv_chunk_size"])
+    prefetch_tar_to_memory = bool(args_dict.get("prefetch_tar_to_memory", False))
 
     part_path = Path(args_dict["part_dir"]) / f"part-worker-{worker_id:02d}.parquet"
     sink = ParquetRowSink(
@@ -859,7 +872,9 @@ def worker_entry(
                 batch: List[Tuple[str, str, bytes]] = []
                 tar_image_count = 0
                 try:
-                    for member_name, payload in iter_tar_images(tar_path):
+                    for member_name, payload in iter_tar_images(
+                        tar_path, prefetch_to_memory=prefetch_tar_to_memory
+                    ):
                         batch.append((str(tar_path), member_name, payload))
                         if len(batch) >= args_dict["decode_batch_size"]:
                             rows = process_batch(

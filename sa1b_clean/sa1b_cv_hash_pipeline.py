@@ -45,6 +45,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tars", type=int, default=0)
     parser.add_argument("--decode-batch-size", type=int, default=512)
     parser.add_argument(
+        "--prefetch-tar-to-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Read each tar file fully into RAM before extraction/decode.",
+    )
+    parser.add_argument(
         "--processes",
         type=int,
         default=2,
@@ -143,6 +149,7 @@ def main() -> None:
                     "yolo_max_det": 1,
                     "yolo_half": False,
                     "decode_batch_size": args.decode_batch_size,
+                    "prefetch_tar_to_memory": bool(args.prefetch_tar_to_memory),
                     "cpu_threads_per_worker": cpu_threads_per_worker,
                     "cv_workers": 1,
                     "cv_chunk_size": max(1, args.cv_chunk_size),
@@ -165,7 +172,8 @@ def main() -> None:
 
     log(
         f"Stage-1 start: tars={len(tar_files)} workers={len(worker_payloads)} "
-        f"threads_total={args.cpu_threads_total} threads_per_worker={cpu_threads_per_worker}"
+        f"threads_total={args.cpu_threads_total} threads_per_worker={cpu_threads_per_worker} "
+        f"prefetch_tar_to_memory={bool(args.prefetch_tar_to_memory)}"
     )
     log(
         f"Filters enabled: blurry, low_information, lighting(dark/light), "
