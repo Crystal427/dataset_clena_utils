@@ -7,7 +7,7 @@ import json
 import math
 import tarfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -328,6 +328,50 @@ class CleanVisionBatchScorer:
         return out
 
 
+def _score_cv_chunk(
+    pil_images_chunk: List[Image.Image], thresholds_dict: Dict[str, float]
+) -> List[Dict[str, Any]]:
+    scorer = CleanVisionBatchScorer(CVThresholds(**thresholds_dict))
+    return scorer.score_batch(pil_images_chunk)
+
+
+def score_cleanvision_metrics(
+    pil_images: List[Image.Image],
+    cleanvision_scorer: CleanVisionBatchScorer,
+    cv_workers: int,
+    cv_chunk_size: int,
+) -> List[Dict[str, Any]]:
+    if not pil_images:
+        return []
+
+    cv_workers = max(1, int(cv_workers))
+    cv_chunk_size = max(1, int(cv_chunk_size))
+
+    if cv_workers == 1 or len(pil_images) <= cv_chunk_size:
+        return cleanvision_scorer.score_batch(pil_images)
+
+    chunks = [
+        pil_images[i : i + cv_chunk_size]
+        for i in range(0, len(pil_images), cv_chunk_size)
+    ]
+    if len(chunks) == 1:
+        return cleanvision_scorer.score_batch(pil_images)
+
+    thresholds_dict = asdict(cleanvision_scorer.thresholds)
+    def _run_chunk(chunk: List[Image.Image]) -> List[Dict[str, Any]]:
+        return _score_cv_chunk(chunk, thresholds_dict)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(cv_workers, len(chunks))
+    ) as pool:
+        chunk_outputs = list(pool.map(_run_chunk, chunks))
+
+    merged: List[Dict[str, Any]] = []
+    for output in chunk_outputs:
+        merged.extend(output)
+    return merged
+
+
 class ParquetRowSink:
     def __init__(
         self,
@@ -639,6 +683,8 @@ def process_batch(
     blur_expand_ratio: float,
     blur_ratio_threshold: float,
     min_context_sharpness: float,
+    cv_workers: int,
+    cv_chunk_size: int,
 ) -> List[Dict[str, Any]]:
     decoded = list(
         decode_pool.map(
@@ -673,7 +719,12 @@ def process_batch(
     pil_images = [item["pil_rgb"] for item in valid_items]
     bgr_images = [item["image_bgr"] for item in valid_items]
 
-    cv_metrics = cleanvision_scorer.score_batch(pil_images)
+    cv_metrics = score_cleanvision_metrics(
+        pil_images=pil_images,
+        cleanvision_scorer=cleanvision_scorer,
+        cv_workers=cv_workers,
+        cv_chunk_size=cv_chunk_size,
+    )
 
     yolo_results: List[Any]
     if yolo_model is None:
@@ -765,6 +816,8 @@ def worker_entry(
 
     thresholds = CVThresholds(**args_dict["cv_thresholds"])
     cleanvision_scorer = CleanVisionBatchScorer(thresholds)
+    cv_workers = max(1, min(args_dict["cv_workers"], args_dict["cpu_threads_per_worker"]))
+    cv_chunk_size = max(1, args_dict["cv_chunk_size"])
 
     part_path = Path(args_dict["part_dir"]) / f"part-worker-{worker_id:02d}.parquet"
     sink = ParquetRowSink(
@@ -812,6 +865,8 @@ def worker_entry(
                             blur_expand_ratio=args_dict["blur_expand_ratio"],
                             blur_ratio_threshold=args_dict["blur_ratio_threshold"],
                             min_context_sharpness=args_dict["min_context_sharpness"],
+                            cv_workers=cv_workers,
+                            cv_chunk_size=cv_chunk_size,
                         )
                         sink.add_rows(rows)
                         total_images += len(rows)
@@ -842,6 +897,8 @@ def worker_entry(
                         blur_expand_ratio=args_dict["blur_expand_ratio"],
                         blur_ratio_threshold=args_dict["blur_ratio_threshold"],
                         min_context_sharpness=args_dict["min_context_sharpness"],
+                        cv_workers=cv_workers,
+                        cv_chunk_size=cv_chunk_size,
                     )
                     sink.add_rows(rows)
                     total_images += len(rows)

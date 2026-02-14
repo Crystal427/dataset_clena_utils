@@ -46,6 +46,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tars", type=int, default=0)
     parser.add_argument("--decode-batch-size", type=int, default=512)
     parser.add_argument("--cpu-threads", type=int, default=220)
+    parser.add_argument(
+        "--cv-workers",
+        type=int,
+        default=1,
+        help="Threads for CleanVision scoring inside each worker process.",
+    )
+    parser.add_argument(
+        "--cv-chunk-size",
+        type=int,
+        default=128,
+        help="Images per chunk for threaded CleanVision scoring.",
+    )
     parser.add_argument("--gpu-devices", type=str, default="4,5,6,7")
     parser.add_argument("--skip-yolo", action="store_true")
     parser.add_argument(
@@ -166,6 +178,8 @@ def main() -> None:
                     "yolo_half": bool(args.yolo_half),
                     "decode_batch_size": args.decode_batch_size,
                     "cpu_threads_per_worker": cpu_threads_per_worker,
+                    "cv_workers": args.cv_workers,
+                    "cv_chunk_size": args.cv_chunk_size,
                     "min_width": args.min_width,
                     "min_height": args.min_height,
                     "blur_expand_ratio": args.blur_expand_ratio,
@@ -182,7 +196,8 @@ def main() -> None:
 
     log(
         f"Found {len(tar_files)} tar files, workers={len(worker_payloads)}, "
-        f"cpu_threads_total={args.cpu_threads}, cpu_threads_per_worker={cpu_threads_per_worker}"
+        f"cpu_threads_total={args.cpu_threads}, cpu_threads_per_worker={cpu_threads_per_worker}, "
+        f"cv_workers={args.cv_workers}, cv_chunk_size={args.cv_chunk_size}"
     )
     log(
         f"YOLO model={resolved_yolo_model}, gpu_devices={gpu_ids}, "

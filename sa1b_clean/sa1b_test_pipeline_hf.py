@@ -44,6 +44,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-parquet", type=Path, required=True)
     parser.add_argument("--max-images", type=int, default=100_000)
     parser.add_argument("--cpu-threads", type=int, default=64)
+    parser.add_argument(
+        "--cv-workers",
+        type=int,
+        default=1,
+        help="Threads for CleanVision scoring in this process.",
+    )
+    parser.add_argument(
+        "--cv-chunk-size",
+        type=int,
+        default=128,
+        help="Images per chunk for threaded CleanVision scoring.",
+    )
     parser.add_argument("--gpu-device", type=int, default=4)
     parser.add_argument("--decode-batch-size", type=int, default=512)
     parser.add_argument("--skip-yolo", action="store_true")
@@ -247,6 +259,8 @@ def main() -> None:
                 blur_expand_ratio=args.blur_expand_ratio,
                 blur_ratio_threshold=args.blur_ratio_threshold,
                 min_context_sharpness=args.min_context_sharpness,
+                cv_workers=args.cv_workers,
+                cv_chunk_size=args.cv_chunk_size,
             )
             remaining = args.max_images - stats["processed_rows"]
             rows = rows[:remaining]
@@ -283,6 +297,8 @@ def main() -> None:
                 blur_expand_ratio=args.blur_expand_ratio,
                 blur_ratio_threshold=args.blur_ratio_threshold,
                 min_context_sharpness=args.min_context_sharpness,
+                cv_workers=args.cv_workers,
+                cv_chunk_size=args.cv_chunk_size,
             )
             remaining = args.max_images - stats["processed_rows"]
             rows = rows[:remaining]
