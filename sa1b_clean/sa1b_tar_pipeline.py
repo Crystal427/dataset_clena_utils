@@ -49,14 +49,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cv-workers",
         type=int,
-        default=1,
-        help="Threads for CleanVision scoring inside each worker process.",
+        default=0,
+        help=(
+            "CleanVision multiprocessing workers per GPU worker. "
+            "0 means auto: min(16, max(1, cpu_threads_per_worker//2))."
+        ),
     )
     parser.add_argument(
         "--cv-chunk-size",
         type=int,
         default=128,
-        help="Images per chunk for threaded CleanVision scoring.",
+        help="Images per CleanVision multiprocessing task.",
     )
     parser.add_argument("--gpu-devices", type=str, default="4,5,6,7")
     parser.add_argument("--skip-yolo", action="store_true")
@@ -141,6 +144,11 @@ def main() -> None:
 
     head_class_ids = parse_csv_ints(args.head_class_ids) if args.head_class_ids else []
     cpu_threads_per_worker = max(1, args.cpu_threads // len(gpu_ids))
+    if args.cv_workers <= 0:
+        cv_workers = min(16, max(1, cpu_threads_per_worker // 2))
+    else:
+        cv_workers = max(1, args.cv_workers)
+    cv_chunk_size = max(1, args.cv_chunk_size)
 
     cv_thresholds = build_cv_thresholds(
         dark_threshold=args.dark_threshold,
@@ -178,8 +186,8 @@ def main() -> None:
                     "yolo_half": bool(args.yolo_half),
                     "decode_batch_size": args.decode_batch_size,
                     "cpu_threads_per_worker": cpu_threads_per_worker,
-                    "cv_workers": args.cv_workers,
-                    "cv_chunk_size": args.cv_chunk_size,
+                    "cv_workers": cv_workers,
+                    "cv_chunk_size": cv_chunk_size,
                     "min_width": args.min_width,
                     "min_height": args.min_height,
                     "blur_expand_ratio": args.blur_expand_ratio,
@@ -197,7 +205,7 @@ def main() -> None:
     log(
         f"Found {len(tar_files)} tar files, workers={len(worker_payloads)}, "
         f"cpu_threads_total={args.cpu_threads}, cpu_threads_per_worker={cpu_threads_per_worker}, "
-        f"cv_workers={args.cv_workers}, cv_chunk_size={args.cv_chunk_size}"
+        f"cv_workers_per_worker={cv_workers}, cv_chunk_size={cv_chunk_size}"
     )
     log(
         f"YOLO model={resolved_yolo_model}, gpu_devices={gpu_ids}, "

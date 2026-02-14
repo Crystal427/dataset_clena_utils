@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import math
+import multiprocessing as mp
 import tarfile
 import time
 from dataclasses import asdict, dataclass
@@ -335,11 +336,19 @@ def _score_cv_chunk(
     return scorer.score_batch(pil_images_chunk)
 
 
+def _score_cv_chunk_tuple(
+    chunk_and_thresholds: Tuple[List[Image.Image], Dict[str, float]]
+) -> List[Dict[str, Any]]:
+    chunk, thresholds_dict = chunk_and_thresholds
+    return _score_cv_chunk(chunk, thresholds_dict)
+
+
 def score_cleanvision_metrics(
     pil_images: List[Image.Image],
     cleanvision_scorer: CleanVisionBatchScorer,
     cv_workers: int,
     cv_chunk_size: int,
+    cv_mp_pool: Optional[Any],
 ) -> List[Dict[str, Any]]:
     if not pil_images:
         return []
@@ -347,24 +356,24 @@ def score_cleanvision_metrics(
     cv_workers = max(1, int(cv_workers))
     cv_chunk_size = max(1, int(cv_chunk_size))
 
-    if cv_workers == 1 or len(pil_images) <= cv_chunk_size:
+    if cv_workers == 1 or cv_mp_pool is None or len(pil_images) <= cv_chunk_size:
         return cleanvision_scorer.score_batch(pil_images)
 
     chunks = [
         pil_images[i : i + cv_chunk_size]
         for i in range(0, len(pil_images), cv_chunk_size)
     ]
-    if len(chunks) == 1:
+    if len(chunks) <= 1:
         return cleanvision_scorer.score_batch(pil_images)
 
     thresholds_dict = asdict(cleanvision_scorer.thresholds)
-    def _run_chunk(chunk: List[Image.Image]) -> List[Dict[str, Any]]:
-        return _score_cv_chunk(chunk, thresholds_dict)
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(cv_workers, len(chunks))
-    ) as pool:
-        chunk_outputs = list(pool.map(_run_chunk, chunks))
+    try:
+        chunk_outputs = cv_mp_pool.map(
+            _score_cv_chunk_tuple, [(chunk, thresholds_dict) for chunk in chunks]
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"CleanVision multiprocessing failed, fallback to single process: {exc}")
+        return cleanvision_scorer.score_batch(pil_images)
 
     merged: List[Dict[str, Any]] = []
     for output in chunk_outputs:
@@ -685,6 +694,7 @@ def process_batch(
     min_context_sharpness: float,
     cv_workers: int,
     cv_chunk_size: int,
+    cv_mp_pool: Optional[Any],
 ) -> List[Dict[str, Any]]:
     decoded = list(
         decode_pool.map(
@@ -724,6 +734,7 @@ def process_batch(
         cleanvision_scorer=cleanvision_scorer,
         cv_workers=cv_workers,
         cv_chunk_size=cv_chunk_size,
+        cv_mp_pool=cv_mp_pool,
     )
 
     yolo_results: List[Any]
@@ -832,19 +843,58 @@ def worker_entry(
     total_decode_errors = 0
     total_tars = 0
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=args_dict["cpu_threads_per_worker"]
-    ) as decode_pool:
-        for tar_idx, tar_path_str in enumerate(tar_paths, start=1):
-            tar_path = Path(tar_path_str)
-            tar_start = time.time()
-            total_tars += 1
-            batch: List[Tuple[str, str, bytes]] = []
-            tar_image_count = 0
-            try:
-                for member_name, payload in iter_tar_images(tar_path):
-                    batch.append((str(tar_path), member_name, payload))
-                    if len(batch) >= args_dict["decode_batch_size"]:
+    cv_mp_pool: Optional[Any] = None
+    if cv_workers > 1:
+        cv_mp_pool = mp.get_context("spawn").Pool(processes=cv_workers)
+        log(f"{worker_name} CleanVision multiprocessing enabled: workers={cv_workers}")
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args_dict["cpu_threads_per_worker"]
+        ) as decode_pool:
+            for tar_idx, tar_path_str in enumerate(tar_paths, start=1):
+                tar_path = Path(tar_path_str)
+                tar_start = time.time()
+                total_tars += 1
+                batch: List[Tuple[str, str, bytes]] = []
+                tar_image_count = 0
+                try:
+                    for member_name, payload in iter_tar_images(tar_path):
+                        batch.append((str(tar_path), member_name, payload))
+                        if len(batch) >= args_dict["decode_batch_size"]:
+                            rows = process_batch(
+                                worker_id=worker_id,
+                                gpu_id=gpu_id,
+                                decode_pool=decode_pool,
+                                cleanvision_scorer=cleanvision_scorer,
+                                yolo_model=yolo_model,
+                                yolo_device=yolo_device,
+                                batch=batch,
+                                min_width=args_dict["min_width"],
+                                min_height=args_dict["min_height"],
+                                yolo_batch_size=args_dict["yolo_batch_size"],
+                                yolo_conf=args_dict["yolo_conf"],
+                                yolo_iou=args_dict["yolo_iou"],
+                                yolo_imgsz=args_dict["yolo_imgsz"],
+                                yolo_max_det=args_dict["yolo_max_det"],
+                                yolo_half=args_dict["yolo_half"],
+                                head_class_ids=args_dict["head_class_ids"],
+                                blur_expand_ratio=args_dict["blur_expand_ratio"],
+                                blur_ratio_threshold=args_dict["blur_ratio_threshold"],
+                                min_context_sharpness=args_dict["min_context_sharpness"],
+                                cv_workers=cv_workers,
+                                cv_chunk_size=cv_chunk_size,
+                                cv_mp_pool=cv_mp_pool,
+                            )
+                            sink.add_rows(rows)
+                            total_images += len(rows)
+                            total_decode_errors += sum(
+                                1 for row in rows if row["decode_error"]
+                            )
+                            tar_image_count += len(rows)
+                            batch.clear()
+
+                    if batch:
                         rows = process_batch(
                             worker_id=worker_id,
                             gpu_id=gpu_id,
@@ -867,52 +917,25 @@ def worker_entry(
                             min_context_sharpness=args_dict["min_context_sharpness"],
                             cv_workers=cv_workers,
                             cv_chunk_size=cv_chunk_size,
+                            cv_mp_pool=cv_mp_pool,
                         )
                         sink.add_rows(rows)
                         total_images += len(rows)
-                        total_decode_errors += sum(
-                            1 for row in rows if row["decode_error"]
-                        )
+                        total_decode_errors += sum(1 for row in rows if row["decode_error"])
                         tar_image_count += len(rows)
                         batch.clear()
+                except Exception as exc:  # noqa: BLE001
+                    log(f"{worker_name} failed on tar {tar_path}: {type(exc).__name__}: {exc}")
 
-                if batch:
-                    rows = process_batch(
-                        worker_id=worker_id,
-                        gpu_id=gpu_id,
-                        decode_pool=decode_pool,
-                        cleanvision_scorer=cleanvision_scorer,
-                        yolo_model=yolo_model,
-                        yolo_device=yolo_device,
-                        batch=batch,
-                        min_width=args_dict["min_width"],
-                        min_height=args_dict["min_height"],
-                        yolo_batch_size=args_dict["yolo_batch_size"],
-                        yolo_conf=args_dict["yolo_conf"],
-                        yolo_iou=args_dict["yolo_iou"],
-                        yolo_imgsz=args_dict["yolo_imgsz"],
-                        yolo_max_det=args_dict["yolo_max_det"],
-                        yolo_half=args_dict["yolo_half"],
-                        head_class_ids=args_dict["head_class_ids"],
-                        blur_expand_ratio=args_dict["blur_expand_ratio"],
-                        blur_ratio_threshold=args_dict["blur_ratio_threshold"],
-                        min_context_sharpness=args_dict["min_context_sharpness"],
-                        cv_workers=cv_workers,
-                        cv_chunk_size=cv_chunk_size,
-                    )
-                    sink.add_rows(rows)
-                    total_images += len(rows)
-                    total_decode_errors += sum(1 for row in rows if row["decode_error"])
-                    tar_image_count += len(rows)
-                    batch.clear()
-            except Exception as exc:  # noqa: BLE001
-                log(f"{worker_name} failed on tar {tar_path}: {type(exc).__name__}: {exc}")
-
-            elapsed = time.time() - tar_start
-            log(
-                f"{worker_name} tar {tar_idx}/{len(tar_paths)} done: "
-                f"{tar_path.name} images={tar_image_count} elapsed={elapsed:.1f}s"
-            )
+                elapsed = time.time() - tar_start
+                log(
+                    f"{worker_name} tar {tar_idx}/{len(tar_paths)} done: "
+                    f"{tar_path.name} images={tar_image_count} elapsed={elapsed:.1f}s"
+                )
+    finally:
+        if cv_mp_pool is not None:
+            cv_mp_pool.close()
+            cv_mp_pool.join()
 
     sink.close()
 

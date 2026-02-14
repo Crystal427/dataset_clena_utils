@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import multiprocessing as mp
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -47,15 +48,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cv-workers",
         type=int,
-        default=1,
-        help="Threads for CleanVision scoring in this process.",
+        default=0,
+        help="CleanVision multiprocessing workers. 0 means auto: min(16, max(1, cpu_threads//2)).",
     )
-    parser.add_argument(
-        "--cv-chunk-size",
-        type=int,
-        default=128,
-        help="Images per chunk for threaded CleanVision scoring.",
-    )
+    parser.add_argument("--cv-chunk-size", type=int, default=128)
     parser.add_argument("--gpu-device", type=int, default=4)
     parser.add_argument("--decode-batch-size", type=int, default=512)
     parser.add_argument("--skip-yolo", action="store_true")
@@ -197,6 +193,11 @@ def main() -> None:
         resolved_yolo_model = ensure_local_yolo_model(args.yolo_model)
 
     head_class_ids = parse_csv_ints(args.head_class_ids) if args.head_class_ids else []
+    if args.cv_workers <= 0:
+        cv_workers = min(16, max(1, args.cpu_threads // 2))
+    else:
+        cv_workers = max(1, args.cv_workers)
+    cv_chunk_size = max(1, args.cv_chunk_size)
     cv_thresholds = build_cv_thresholds(
         dark_threshold=args.dark_threshold,
         light_threshold=args.light_threshold,
@@ -211,6 +212,11 @@ def main() -> None:
     yolo_model = None if args.skip_yolo else YOLO(resolved_yolo_model)
     yolo_device = f"cuda:{args.gpu_device}"
     scorer = CleanVisionBatchScorer(CVThresholds(**cv_thresholds))
+    cv_mp_pool = None
+    if cv_workers > 1:
+        cv_mp_pool = mp.get_context("spawn").Pool(processes=cv_workers)
+        log(f"CleanVision multiprocessing enabled for test pipeline: workers={cv_workers}")
+
     args.output_parquet.parent.mkdir(parents=True, exist_ok=True)
     sink = ParquetRowSink(
         output_path=args.output_parquet,
@@ -229,86 +235,95 @@ def main() -> None:
         "yolo_model": resolved_yolo_model,
         "dataset_root": str(args.dataset_root),
         "output_parquet": str(args.output_parquet),
+        "cv_workers": cv_workers,
+        "cv_chunk_size": cv_chunk_size,
     }
 
     start = time.time()
     batch: List[Tuple[str, str, bytes]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.cpu_threads) as decode_pool:
-        for item in iter_tar_items(tar_files):
-            batch.append(item)
-            if len(batch) < args.decode_batch_size:
-                continue
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.cpu_threads) as decode_pool:
+            for item in iter_tar_items(tar_files):
+                batch.append(item)
+                if len(batch) < args.decode_batch_size:
+                    continue
 
-            rows = process_batch(
-                worker_id=0,
-                gpu_id=args.gpu_device,
-                decode_pool=decode_pool,
-                cleanvision_scorer=scorer,
-                yolo_model=yolo_model,
-                yolo_device=yolo_device,
-                batch=batch,
-                min_width=args.min_width,
-                min_height=args.min_height,
-                yolo_batch_size=args.yolo_batch_size,
-                yolo_conf=args.yolo_conf,
-                yolo_iou=args.yolo_iou,
-                yolo_imgsz=args.yolo_imgsz,
-                yolo_max_det=args.yolo_max_det,
-                yolo_half=args.yolo_half,
-                head_class_ids=head_class_ids,
-                blur_expand_ratio=args.blur_expand_ratio,
-                blur_ratio_threshold=args.blur_ratio_threshold,
-                min_context_sharpness=args.min_context_sharpness,
-                cv_workers=args.cv_workers,
-                cv_chunk_size=args.cv_chunk_size,
-            )
-            remaining = args.max_images - stats["processed_rows"]
-            rows = rows[:remaining]
-            sink.add_rows(rows)
-            stats["processed_rows"] += len(rows)
-            stats["decode_error_rows"] += sum(1 for row in rows if row["decode_error"])
-            stats["quality_issue_rows"] += sum(1 for row in rows if row["is_quality_issue"])
-            stats["head_blur_anomaly_rows"] += sum(
-                1 for row in rows if row["is_any_head_blur_anomaly"]
-            )
-            batch.clear()
+                rows = process_batch(
+                    worker_id=0,
+                    gpu_id=args.gpu_device,
+                    decode_pool=decode_pool,
+                    cleanvision_scorer=scorer,
+                    yolo_model=yolo_model,
+                    yolo_device=yolo_device,
+                    batch=batch,
+                    min_width=args.min_width,
+                    min_height=args.min_height,
+                    yolo_batch_size=args.yolo_batch_size,
+                    yolo_conf=args.yolo_conf,
+                    yolo_iou=args.yolo_iou,
+                    yolo_imgsz=args.yolo_imgsz,
+                    yolo_max_det=args.yolo_max_det,
+                    yolo_half=args.yolo_half,
+                    head_class_ids=head_class_ids,
+                    blur_expand_ratio=args.blur_expand_ratio,
+                    blur_ratio_threshold=args.blur_ratio_threshold,
+                    min_context_sharpness=args.min_context_sharpness,
+                    cv_workers=cv_workers,
+                    cv_chunk_size=cv_chunk_size,
+                    cv_mp_pool=cv_mp_pool,
+                )
+                remaining = args.max_images - stats["processed_rows"]
+                rows = rows[:remaining]
+                sink.add_rows(rows)
+                stats["processed_rows"] += len(rows)
+                stats["decode_error_rows"] += sum(1 for row in rows if row["decode_error"])
+                stats["quality_issue_rows"] += sum(1 for row in rows if row["is_quality_issue"])
+                stats["head_blur_anomaly_rows"] += sum(
+                    1 for row in rows if row["is_any_head_blur_anomaly"]
+                )
+                batch.clear()
 
-            if stats["processed_rows"] >= args.max_images:
-                break
+                if stats["processed_rows"] >= args.max_images:
+                    break
 
-        if batch and stats["processed_rows"] < args.max_images:
-            rows = process_batch(
-                worker_id=0,
-                gpu_id=args.gpu_device,
-                decode_pool=decode_pool,
-                cleanvision_scorer=scorer,
-                yolo_model=yolo_model,
-                yolo_device=yolo_device,
-                batch=batch,
-                min_width=args.min_width,
-                min_height=args.min_height,
-                yolo_batch_size=args.yolo_batch_size,
-                yolo_conf=args.yolo_conf,
-                yolo_iou=args.yolo_iou,
-                yolo_imgsz=args.yolo_imgsz,
-                yolo_max_det=args.yolo_max_det,
-                yolo_half=args.yolo_half,
-                head_class_ids=head_class_ids,
-                blur_expand_ratio=args.blur_expand_ratio,
-                blur_ratio_threshold=args.blur_ratio_threshold,
-                min_context_sharpness=args.min_context_sharpness,
-                cv_workers=args.cv_workers,
-                cv_chunk_size=args.cv_chunk_size,
-            )
-            remaining = args.max_images - stats["processed_rows"]
-            rows = rows[:remaining]
-            sink.add_rows(rows)
-            stats["processed_rows"] += len(rows)
-            stats["decode_error_rows"] += sum(1 for row in rows if row["decode_error"])
-            stats["quality_issue_rows"] += sum(1 for row in rows if row["is_quality_issue"])
-            stats["head_blur_anomaly_rows"] += sum(
-                1 for row in rows if row["is_any_head_blur_anomaly"]
-            )
+            if batch and stats["processed_rows"] < args.max_images:
+                rows = process_batch(
+                    worker_id=0,
+                    gpu_id=args.gpu_device,
+                    decode_pool=decode_pool,
+                    cleanvision_scorer=scorer,
+                    yolo_model=yolo_model,
+                    yolo_device=yolo_device,
+                    batch=batch,
+                    min_width=args.min_width,
+                    min_height=args.min_height,
+                    yolo_batch_size=args.yolo_batch_size,
+                    yolo_conf=args.yolo_conf,
+                    yolo_iou=args.yolo_iou,
+                    yolo_imgsz=args.yolo_imgsz,
+                    yolo_max_det=args.yolo_max_det,
+                    yolo_half=args.yolo_half,
+                    head_class_ids=head_class_ids,
+                    blur_expand_ratio=args.blur_expand_ratio,
+                    blur_ratio_threshold=args.blur_ratio_threshold,
+                    min_context_sharpness=args.min_context_sharpness,
+                    cv_workers=cv_workers,
+                    cv_chunk_size=cv_chunk_size,
+                    cv_mp_pool=cv_mp_pool,
+                )
+                remaining = args.max_images - stats["processed_rows"]
+                rows = rows[:remaining]
+                sink.add_rows(rows)
+                stats["processed_rows"] += len(rows)
+                stats["decode_error_rows"] += sum(1 for row in rows if row["decode_error"])
+                stats["quality_issue_rows"] += sum(1 for row in rows if row["is_quality_issue"])
+                stats["head_blur_anomaly_rows"] += sum(
+                    1 for row in rows if row["is_any_head_blur_anomaly"]
+                )
+    finally:
+        if cv_mp_pool is not None:
+            cv_mp_pool.close()
+            cv_mp_pool.join()
 
     sink.close()
     elapsed = time.time() - start
