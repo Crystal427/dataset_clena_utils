@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import tarfile
 import time
 from dataclasses import dataclass
@@ -98,6 +99,43 @@ def split_round_robin(items: Sequence[Path], bucket_count: int) -> List[List[Pat
     for idx, item in enumerate(items):
         buckets[idx % bucket_count].append(item)
     return buckets
+
+
+def _parse_visible_cuda_devices(env_value: str) -> Optional[List[int]]:
+    tokens = [t.strip() for t in env_value.split(",") if t.strip()]
+    if not tokens:
+        return None
+    if any(not t.lstrip("-").isdigit() for t in tokens):
+        return None
+    parsed = [int(t) for t in tokens]
+    if any(x < 0 for x in parsed):
+        return None
+    return parsed
+
+
+def resolve_torch_cuda_index(requested_gpu: int) -> int:
+    env_value = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not env_value:
+        return requested_gpu
+
+    visible = _parse_visible_cuda_devices(env_value)
+    if not visible:
+        # UUID/MIG or non-integer format: let torch handle local index directly.
+        return requested_gpu
+
+    # If user passed physical GPU id (e.g., 4) and CUDA_VISIBLE_DEVICES=4,5,6,7,
+    # remap to process-local index 0.
+    if requested_gpu in visible:
+        return visible.index(requested_gpu)
+
+    # If user already passed local index (e.g., 0..N-1), keep it.
+    if 0 <= requested_gpu < len(visible):
+        return requested_gpu
+
+    raise ValueError(
+        f"GPU id {requested_gpu} is incompatible with CUDA_VISIBLE_DEVICES={env_value}. "
+        "Pass either physical ids from CUDA_VISIBLE_DEVICES or local indices 0..N-1."
+    )
 
 
 def ensure_local_yolo_model(model_ref: str) -> str:
@@ -755,10 +793,11 @@ def worker_entry(
     args_dict: Dict[str, Any],
 ) -> Dict[str, Any]:
     worker_start = time.time()
-    worker_name = f"W{worker_id}-GPU{gpu_id}"
+    local_cuda_index = resolve_torch_cuda_index(gpu_id)
+    worker_name = f"W{worker_id}-GPU{gpu_id}(cuda:{local_cuda_index})"
     log(f"{worker_name} starting with {len(tar_paths)} tar files")
 
-    yolo_device = f"cuda:{gpu_id}"
+    yolo_device = f"cuda:{local_cuda_index}"
     yolo_model: Optional[YOLO] = None
     if not args_dict["skip_yolo"]:
         yolo_model = YOLO(args_dict["yolo_model"])

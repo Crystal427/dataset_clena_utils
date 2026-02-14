@@ -29,6 +29,7 @@ from utils.pipeline_utils import (
     log,
     parse_csv_ints,
     process_batch,
+    resolve_torch_cuda_index,
     validate_head_model,
 )
 
@@ -196,8 +197,10 @@ def main() -> None:
         odd_size_threshold=args.odd_size_threshold,
     )
 
+    local_cuda_index = resolve_torch_cuda_index(args.gpu_device)
     yolo_model = None if args.skip_yolo else YOLO(resolved_yolo_model)
-    yolo_device = f"cuda:{args.gpu_device}"
+    yolo_device = f"cuda:{local_cuda_index}"
+    log(f"GPU mapping: requested={args.gpu_device} -> torch_device={yolo_device}")
     scorer = CleanVisionBatchScorer(CVThresholds(**cv_thresholds))
     args.output_parquet.parent.mkdir(parents=True, exist_ok=True)
     sink = ParquetRowSink(
